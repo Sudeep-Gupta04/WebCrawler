@@ -1,0 +1,433 @@
+DISTRIBUTED WEB CRAWLER — PROJECT CONTEXT FOR ANTIGRAVITY
+=============================================================
+
+Purpose
+-------
+This document explains the WebCrawler repository so an AI coding/testing assistant
+such as Antigravity can understand the intended architecture, responsibilities,
+file structure, and safe testing approach.
+
+IMPORTANT: This guide is based on the directory tree and implementation details
+provided by the developer. It describes intended responsibilities, not proof that
+every end-to-end path has already been tested. Inspect the current source code and
+configuration before assuming behavior. Do not treat generated build output as
+source of truth.
+
+1. PROJECT OVERVIEW
+-------------------
+The project is a distributed web crawler built from separate Spring Boot services.
+Its intended pipeline is:
+
+  Client
+    |
+    v
+  Admin Service (REST API)
+    |
+    v
+  Redis queue (pending crawl tasks + discovered/visited tracking)
+    |
+    v
+  Crawler Service (workers fetch pages and extract information/links)
+    |
+    v
+  Kafka topic: crawl-results
+    |
+    v
+  Indexing Service (Kafka consumer)
+    |
+    v
+  Elasticsearch index: web-pages
+    |
+    v
+  Search Service (REST search API)
+    |
+    v
+  Client receives matching pages as JSON
+
+The exact runtime ports, Docker Compose service names, retry policy, Kafka offset
+behavior, and deployment topology must be verified from the current properties
+and Docker configuration. Do not invent them.
+
+2. SERVICE RESPONSIBILITIES
+---------------------------
+
+A. admin-service
+~~~~~~~~~~~~~~~~
+Role:
+- Exposes an HTTP API for submitting a URL to crawl.
+- Validates the incoming request through a DTO.
+- Delegates queue operations to a service that enqueues crawl work in Redis.
+- Uses a centralized exception handler for API errors.
+
+Source structure:
+  admin-service/src/main/java/com/webcrawler/admin/
+    AdminServiceApplication.java
+    controller/CrawlController.java
+    dto/CrawlRequest.java
+    exception/ApiExceptionHandler.java
+    service/CrawlQueueService.java
+
+File responsibilities:
+- AdminServiceApplication.java
+  Spring Boot application entry point.
+- controller/CrawlController.java
+  REST controller for receiving crawl requests. Inspect its mappings to confirm
+  the exact endpoint, HTTP method, and response format.
+- dto/CrawlRequest.java
+  Request DTO for incoming crawl data, expected to carry the URL and validation
+  constraints. Confirm field names and validation annotations from source.
+- exception/ApiExceptionHandler.java
+  Central place for translating application exceptions into HTTP error responses.
+- service/CrawlQueueService.java
+  Adds crawl tasks to Redis. Inspect implementation to understand queue keys,
+  duplicate prevention, and task payload format.
+- src/main/resources/application.properties
+  Runtime settings such as service port, Redis connection, and queue configuration.
+- build.gradle
+  Gradle plugins and dependencies for building/running/testing this service.
+- src/test/.../AdminServiceApplicationTests.java
+  Spring Boot test class. Check actual test coverage; a context-load test alone
+  does not prove the API or Redis behavior works.
+
+B. crawler-service
+~~~~~~~~~~~~~~~~~
+Role:
+- Retrieves queued crawl tasks from Redis.
+- Fetches pages over HTTP using Jsoup.
+- Extracts page information and discovered links.
+- Publishes crawl results to Kafka for indexing.
+- Uses a worker/executor setup so multiple network fetches can run concurrently.
+
+Source structure:
+  crawler-service/src/main/java/com/crawlerservice/crawler_service/
+    config/
+      CrawlerExecutorConfig.java
+      JacksonConfig.java
+    model/
+      CrawlResult.java
+      CrawlTask.java
+    modles/
+      CrawlResult.java
+    publisher/CrawlResultPublisher.java
+    queue/RedisCrawlQueue.java
+    service/
+      PageCrawlerService.java
+      UrlNormalizationService.java
+    worker/CrawlWorker.java
+    CrawlerServiceApplication.java
+
+File responsibilities:
+- CrawlerServiceApplication.java
+  Spring Boot application entry point.
+- config/CrawlerExecutorConfig.java
+  Configures the executor/thread pool used to run crawl tasks. Verify pool size,
+  queue capacity, and rejection policy in source/config.
+- config/JacksonConfig.java
+  Jackson serialization/deserialization configuration, if needed by the app.
+- model/CrawlTask.java
+  Represents a crawl task, potentially including URL and depth. Confirm exact fields.
+- model/CrawlResult.java
+  Represents the result sent downstream. Known fields in the described implementation:
+  url, title, content, statusCode, crawledAt, discoveredLinks.
+- modles/CrawlResult.java
+  The tree shows a second, misspelled-package/directory variant. This may be stale,
+  duplicate, or unused code. Inspect references before modifying or deleting it.
+- queue/RedisCrawlQueue.java
+  Redis queue operations, including polling/enqueuing tasks and duplicate tracking.
+  The described implementation uses queue key "crawler:urls:pending" and a Redis
+  Lua script to coordinate discovery/queue insertion. Verify current constants and
+  script before testing.
+- service/PageCrawlerService.java
+  Fetches a web page with Jsoup and extracts title/content/links. The described
+  implementation used a 10-second timeout, followed redirects, ignored HTTP
+  errors, and limited response body size to 2 MB; check current code for exact values.
+- service/UrlNormalizationService.java
+  Normalizes URLs before they are queued or compared. Inspect normalization rules.
+- publisher/CrawlResultPublisher.java
+  Serializes CrawlResult to JSON and sends it to Kafka. The described implementation
+  uses topic "crawl-results" and waits up to 10 seconds for send completion; verify
+  current code and producer settings.
+- worker/CrawlWorker.java
+  Polls Redis and submits work to the configured executor. The described version
+  uses a poller thread plus a ThreadPoolExecutor; it shuts down worker resources
+  during application shutdown. Verify behavior in current code.
+- src/main/resources/application.properties
+  Redis, Kafka, queue, depth, and executor settings.
+- build.gradle
+  Gradle dependencies; inspect to confirm the active dependencies and versions.
+
+C. indexing-service
+~~~~~~~~~~~~~~~~~~~
+Role:
+- Consumes crawl-result JSON messages from Kafka.
+- Deserializes messages into a local model.
+- Converts each message into an Elasticsearch document.
+- Saves the document into the shared Elasticsearch index named "web-pages".
+
+Source structure:
+  indexing-service/src/main/java/com/indexingservice/indexing_service/
+    IndexingServiceApplication.java
+    model/CrawlResultMessage.java
+    document/WebPageDocument.java
+    repository/WebPageRepository.java
+    service/IndexingService.java
+    listener/CrawlResultListener.java
+
+File responsibilities:
+- IndexingServiceApplication.java
+  Spring Boot application entry point.
+- model/CrawlResultMessage.java
+  Message model corresponding to the crawler's JSON payload. Fields should remain
+  compatible with CrawlResult. Verify names and types in both source files.
+- document/WebPageDocument.java
+  Elasticsearch document mapping. The intended index is "web-pages".
+- repository/WebPageRepository.java
+  Spring Data Elasticsearch repository for saving/retrieving documents.
+- service/IndexingService.java
+  Maps incoming messages to documents, validates the URL, creates a deterministic
+  SHA-256 ID from the URL in the described implementation, and saves the document.
+  Verify exact behavior from current source.
+- listener/CrawlResultListener.java
+  Kafka listener for the crawl-results topic. Deserializes JSON and invokes the
+  indexing service. Verify consumer group, error handling, and offset/retry behavior.
+- src/main/resources/application.properties
+  Kafka consumer and Elasticsearch connection settings.
+- build.gradle
+  Includes the Elasticsearch and Kafka starters, plus Jackson dependencies in the
+  described setup. Confirm current contents.
+
+D. search-service
+~~~~~~~~~~~~~~~~~
+Role:
+- Exposes a REST API to search already-indexed documents in Elasticsearch.
+- It should not need Kafka for its current responsibility; Kafka is used upstream
+  by the crawler publisher and indexing consumer.
+- It reads the same Elasticsearch instance and "web-pages" index as indexing-service.
+
+Source structure:
+  search-service/src/main/java/com/searchservice/search_service/
+    SearchServiceApplication.java
+    controller/SearchController.java
+    document/WebPageDocument.java
+    service/SearchService.java
+
+File responsibilities:
+- SearchServiceApplication.java
+  Spring Boot application entry point.
+- document/WebPageDocument.java
+  Local representation of the Elasticsearch document. Its index name and fields
+  must match the document written by indexing-service.
+- service/SearchService.java
+  Builds and executes Elasticsearch searches. The described initial implementation
+  searches title OR content and limits results to 20. Verify actual query semantics,
+  escaping, pagination, and error behavior in current code.
+- controller/SearchController.java
+  Exposes GET /api/search with query parameter q in the described implementation.
+  Example request: GET /api/search?q=java. Confirm exact mapping and response shape.
+- src/main/resources/application.properties
+  Elasticsearch URI and application settings.
+- build.gradle
+  The current intended dependencies are Spring Data Elasticsearch and Spring WebMVC.
+  Kafka dependencies were identified as unnecessary for the search-only role and
+  were removed in the described setup; verify the current file.
+
+3. DATA CONTRACTS
+-----------------
+Crawler result fields described so far:
+- url: page URL
+- title: extracted page title
+- content: extracted page text
+- statusCode: HTTP status code observed by the crawler
+- crawledAt: timestamp, expected to be an Instant/ISO-8601 JSON value
+- discoveredLinks: links extracted from the page
+
+Keep the following aligned:
+1. Crawler's CrawlResult JSON field names/types.
+2. Indexing Service's CrawlResultMessage fields/types.
+3. Indexing Service's WebPageDocument mapping.
+4. Search Service's WebPageDocument mapping.
+
+Elasticsearch index:
+- Intended index name: web-pages
+- Both indexing and search must point to the same Elasticsearch cluster.
+- The index may need to be created/mapped depending on application configuration and
+  Elasticsearch version. Verify index existence and mappings during integration tests.
+
+4. INFRASTRUCTURE AND LOCAL CONFIGURATION
+-----------------------------------------
+Infrastructure components referenced in this project:
+- Redis: pending crawl queue and duplicate/discovered URL tracking.
+- Kafka: transports crawl results from crawler-service to indexing-service.
+- Elasticsearch: stores indexed page documents and serves search queries.
+- Docker: may run infrastructure components as containers; application services may
+  run locally or in containers.
+
+Important localhost rule:
+- If a Spring Boot service runs directly on the Windows host and Elasticsearch's
+  port 9200 is published to the host, http://localhost:9200 may be correct.
+- If the service runs inside Docker Compose, localhost refers to that service's own
+  container. Use the Elasticsearch Compose service name, e.g. http://elasticsearch:9200,
+  only if that is the actual Compose service name and they share a Docker network.
+- Similar host/container distinctions apply to Redis and Kafka.
+- Port 9300 is Elasticsearch transport communication and is usually not needed by
+  a Spring Data Elasticsearch client; HTTP API traffic normally uses port 9200.
+- Do not disable security for production. If local development disables Elasticsearch
+  security, make sure the environment is isolated and not exposed publicly.
+
+Do not assume that a service is running merely because a build succeeds. Build,
+unit, integration, and end-to-end tests prove different things.
+
+5. REPOSITORY HYGIENE / DIRECTORY NOTES
+---------------------------------------
+The provided tree includes generated/build artifacts:
+- .gradle/
+- build/
+- bin/
+- compiled .class files
+- generated Gradle reports and jars
+
+These are not the primary source files to edit. Prefer:
+- src/main/java/
+- src/main/resources/
+- src/test/java/
+- build.gradle
+- settings.gradle
+- gradlew / gradlew.bat
+
+The tree includes both bin/ and build/ outputs for some services. These may be stale
+or generated by different IDE/build workflows. Do not edit .class files directly.
+When diagnosing behavior, inspect source under src/ and active Gradle configuration.
+
+Potential issues worth checking:
+- crawler-service has a `modles/` directory containing a second CrawlResult class.
+  Determine whether it is referenced; avoid deleting it without checking.
+- indexing-service's build output shows classes under both
+  `com/crawlerservice/indexing_service/` and `com/indexingservice/indexing_service/`.
+  The provided source tree shows the latter as the intended package. Check for stale
+  build output or misplaced source files and run a clean build to validate.
+- Confirm all services use compatible Kafka topic names, JSON field names, Elasticsearch
+  index name, and host/container connection URLs.
+- Confirm ports do not conflict and are documented in the actual properties/Compose file.
+
+6. TESTING PLAN FOR ANTIGRAVITY
+-------------------------------
+Act as a careful testing engineer. First inspect the current source and configuration.
+Do not immediately rewrite the architecture or refactor unrelated files.
+
+Phase 1 — Baseline build:
+1. Run `.\gradlew.bat clean build` separately inside each service directory:
+   admin-service, crawler-service, indexing-service, search-service.
+2. Record which builds pass/fail and capture exact errors.
+3. Do not treat a successful compile alone as proof of runtime integration.
+
+Phase 2 — Unit/service tests:
+1. Review existing tests and identify whether they test only Spring context loading.
+2. Add focused tests for URL validation, normalization, duplicate queue behavior,
+   result mapping, and search query handling where practical.
+3. Use mocks for Redis, Kafka, Elasticsearch operations/repositories in unit tests.
+4. Keep tests deterministic and do not require external services unless explicitly
+   classified as integration tests.
+
+Phase 3 — API tests:
+1. Inspect CrawlController mappings and request DTO to identify the real endpoint,
+   request JSON, validation behavior, and response codes.
+2. Test valid crawl request, malformed/blank URL, invalid URL, and service failure.
+3. Inspect SearchController mapping. Test missing/blank q, a query with matches,
+   and a query with no matches.
+4. Do not assume the example endpoint or payload without checking source.
+
+Phase 4 — Integration tests:
+1. Verify Redis is reachable and the admin endpoint really enqueues a task.
+2. Verify crawler workers poll the task, fetch an allowed test page, and publish JSON
+   to the configured Kafka topic.
+3. Verify indexing-service consumes that message and stores a document in Elasticsearch.
+4. Verify search-service can retrieve that document through the search API.
+5. Prefer a controlled local test page or a stable test endpoint over crawling arbitrary
+   sites. Avoid high request rates, crawling private/internal network addresses, or
+   bypassing robots/access restrictions.
+6. Confirm the final indexed document includes expected URL, title, content, status,
+   timestamp, and discovered links.
+7. If infrastructure is unavailable, report that integration testing is blocked rather
+   than claiming success.
+
+Phase 5 — Reliability and edge cases:
+- Duplicate URL submissions and normalization.
+- Invalid URLs, redirects, 4xx/5xx responses, timeouts, oversized responses.
+- Pages with missing title or empty content.
+- URLs with query strings/fragments and different trailing slashes.
+- Kafka unavailable, Elasticsearch unavailable, Redis unavailable.
+- Malformed Kafka JSON and deserialization errors.
+- Executor saturation and graceful shutdown.
+- Elasticsearch empty result sets, special characters, very long queries, and large
+  result sets.
+- Verify timeout, retry, dead-letter, and offset commit behavior from actual config;
+  do not assume they exist.
+- Check whether crawl depth is enforced and whether discovered links are re-enqueued.
+
+7. EXPECTED TEST REPORT
+----------------------
+Return a concise but useful report with:
+- Repository/service inspected.
+- Commands run and exact pass/fail results.
+- Tests added or modified and why.
+- Runtime dependencies required and whether they were available.
+- API requests performed and sanitized response summaries.
+- Bugs found, severity, evidence, and source file/line when possible.
+- Minimal recommended fixes.
+- Any untested assumptions or blocked test stages.
+
+8. SAFETY / CHANGE CONTROL INSTRUCTIONS
+---------------------------------------
+- Treat the existing source code and configuration as authoritative; this document
+  is orientation, not a substitute for code inspection.
+- Do not make broad refactors or delete files without evidence.
+- Do not edit generated .class files or Gradle output directories.
+- Do not expose credentials, tokens, environment variables, or private local data in
+  logs or reports.
+- Do not run destructive commands, wipe Redis/Elasticsearch data, delete volumes, or
+  reset queues/indexes without explicit approval.
+- Do not crawl arbitrary external sites at high volume. Use a controlled test target.
+- Make small, reviewable changes and explain every change.
+- Before changing dependencies or application architecture, report why the change is
+  needed.
+- If code or configuration contradicts this guide, report the discrepancy and follow
+  the actual code unless the developer explicitly authorizes a change.
+
+9. QUICK COMMANDS (WINDOWS POWERSHELL)
+--------------------------------------
+Run from each service's directory:
+
+  .\gradlew.bat clean build
+
+Run an individual Spring Boot app (only after its dependencies are available):
+
+  .\gradlew.bat bootRun
+
+Check Docker containers:
+
+  docker ps
+
+Check Elasticsearch HTTP API if port 9200 is published to the Windows host:
+
+  Invoke-RestMethod http://localhost:9200
+
+Do not assume the same commands or localhost URLs work from inside containers.
+
+10. CURRENT KNOWN CONTEXT / LIMITATIONS
+---------------------------------------
+- Java 21 and Spring Boot 4.1.1 were used in the described projects; verify current
+  Gradle files before relying on these versions.
+- Gradle wrapper output showed Gradle 9.8.1 in generated directories; verify wrapper
+  properties for each project.
+- The intended Kafka topic is `crawl-results`.
+- The intended Elasticsearch index is `web-pages`.
+- The described Redis queue key is `crawler:urls:pending`.
+- The crawler's described Jsoup fetch timeout is 10 seconds and response size limit
+  is 2 MB; verify current source.
+- Search API example is `GET /api/search?q=java`, with up to 20 results in the described
+  initial service implementation; verify current source.
+- Exact service ports and the complete Docker Compose topology were not included in
+  the provided directory tree. Inspect properties/Compose files before running
+  end-to-end tests.
+
+END OF PROJECT CONTEXT

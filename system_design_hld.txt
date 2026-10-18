@@ -1,0 +1,38 @@
+[ Admin User ] 
+      │
+      │ 1. Send Seed URL (API)
+      ▼
++-------------------------------------------------+
+|               REDIS (The Manager)               |
+|  - URL Queue (To-Do List)                       |
+|  - Bloom Filter (Visited Links)                 |
++-------------------------------------------------+
+      ▲                               │
+      │ 4. Push New Links             │ 2. Pop URL (Poller)
+      │    (If not visited)           ▼
++-------------------------------------------------+          3. Download HTML
+|          CRAWLER WORKER (Spring Boot)           | ────────────────────────► ( INTERNET )
+|  - ExecutorService (100 Threads)                | ◄──────────────────────── 
+|  - JSoup HTML Parser                            |           Return HTML
++-------------------------------------------------+
+      │
+      │ 5. Publish Clean Text / Price Data
+      ▼
++-------------------------------------------------+
+|             KAFKA (The Event Bus)               |
+|  Topic: raw-crawled-data                        |
++-------------------------------------------------+
+      │                               │
+      │ 6. Consume Event              │ 6. Consume Event
+      ▼                               ▼
++-----------------------+     +-----------------------+
+|  INDEXING SERVICE     |     | ALERT / AI SERVICE    |
+|  (Spring Boot)        |     | (Spring Boot)         |
++-----------------------+     +-----------------------+
+      │
+      │ 7. Save Inverted Index
+      ▼
++-----------------------+          8. Search Query
+|    ELASTICSEARCH      | ◄────────────────────────── [ End User ]
+|    (Database)         | ──────────────────────────► (Sees Fast Results)
++-----------------------+          9. Return Data
