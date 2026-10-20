@@ -19,43 +19,11 @@ The web is massive, unstructured, and constantly evolving. Searching and extract
 
 ## 2. High-Level Design (HLD)
 
-The architecture follows a distributed, decoupled pipeline where storage, queuing, processing, and retrieval are isolated into independent layers:
+The system is decomposed into four independent layers — **URL Frontier**, **Crawling & Extraction**, **Event Streaming**, and **Search & Retrieval** — each communicating asynchronously to prevent backpressure and enable independent scaling.
 
-```mermaid
-flowchart TD
-    AdminUser["👤 Admin User\n(API)"] -->|1. Send Seed URL| Redis
+![High-Level Architecture Diagram](hld-img.png)
 
-    subgraph Frontier ["URL Frontier & Deduplication"]
-        Redis[("Redis\n• URL Queue (To-Do List)\n• Bloom Filter / Set (Visited Links)")]
-    end
-
-    Redis -->|2. Pop URL (Poller)| WorkerCluster
-    WorkerCluster -->|4. Push New Links (If not visited)| Redis
-
-    subgraph CrawlerLayer ["Crawling & Extraction Layer"]
-        WorkerCluster["Crawler Worker (Spring Boot)\n• ExecutorService (Multi-threaded)\n• JSoup HTML Parser"]
-    end
-
-    WorkerCluster <-->|3. Download HTML / Return HTML| Internet(("🌐 Internet / Web"))
-    WorkerCluster -->|5. Publish Clean Text / Metadata| Kafka
-
-    subgraph StreamLayer ["Event Streaming Broker"]
-        Kafka[("Kafka Topic\n(raw-crawled-data)")]
-    end
-
-    Kafka -->|6. Consume Event| IndexingService["Indexing Service\n(Spring Boot)"]
-    Kafka -->|6. Consume Event| AlertService["Alert / AI Service\n(Extensible Consumer)"]
-
-    IndexingService -->|7. Save Inverted Index| Elasticsearch[("Elasticsearch\n(Inverted Index Database)")]
-
-    subgraph SearchLayer ["Search & Retrieval Layer"]
-        SearchService["Search Service\n(Spring Boot)"]
-    end
-
-    Elasticsearch <--> SearchService
-    EndUser["👤 End User\n(Search Query)"] -->|8. Search Query| SearchService
-    SearchService -->|9. Return Results| EndUser
-```
+> **Architecture Summary:** An Admin submits a seed URL → Redis manages the URL queue and deduplication → Crawler Workers fetch HTML and extract links → Kafka decouples crawl output from downstream consumers → Indexing Service writes to Elasticsearch → Search Service answers end-user queries in milliseconds.
 
 ---
 
